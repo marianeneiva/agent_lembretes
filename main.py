@@ -1,5 +1,6 @@
 import os
 import json
+import redis
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
@@ -7,8 +8,8 @@ import anthropic
 app = Flask(__name__)
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Armazena histórico e tarefas por número de telefone
-usuarios = {}
+# Redis para persistência
+redis_client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
 
 SYSTEM_PROMPT = """Você é um agente pessoal de lembretes e tarefas em português brasileiro.
 Ajude o usuário a lembrar de pagar contas e fazer tarefas via WhatsApp.
@@ -48,28 +49,18 @@ Regras:
 """
 
 def get_user_state(phone):
-    if phone not in usuarios:
-        usuarios[phone] = {"history": [], "tasks": []}
-    return usuarios[phone]
+    key = f"user:{phone}"
+    data = redis_client.get(key)
+    if data:
+        return json.loads(data)
+    return {"history": [], "tasks": []}
 
-def format_task_list(tasks):
-    """Formata lista de tarefas para exibição em texto simples."""
-    pending = [t for t in tasks if not t.get("done")]
-    done = [t for t in tasks if t.get("done")]
-
-    lines = []
-    if pending:
-        lines.append(f"📋 *Pendentes ({len(pending)}):*")
-        for t in pending:
-            icon = "🔴" if t.get("urgent") else ("💰" if t.get("type") == "bill" else "✅")
-            detail = f" — {t['detail']}" if t.get("detail") else ""
-            lines.append(f"  {icon} {t['name']}{detail}")
-    if done:
-        lines.append(f"\n✅ *Concluídas ({len(done)}):*")
-        for t in done:
-            lines.append(f"  ~~{t['name']}~~")
-
-    return "\n".join(lines) if lines else "Nenhuma tarefa ainda!"
+def save_user_state(phone, state):
+    key = f"user:{phone}"
+    # Mantém histórico em no máximo 20 mensagens
+    if len(state["history"]) > 20:
+        state["history"] = state["history"][-20:]
+    redis_client.set(key, json.dumps(state, ensure_ascii=False))
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -80,10 +71,6 @@ def webhook():
     task_context = f"\n\nLista atual de tarefas do usuário: {json.dumps(state['tasks'], ensure_ascii=False)}"
 
     state["history"].append({"role": "user", "content": incoming_msg})
-
-    # Mantém histórico em no máximo 20 mensagens para não estourar contexto
-    if len(state["history"]) > 20:
-        state["history"] = state["history"][-20:]
 
     try:
         response = client.messages.create(
@@ -109,16 +96,16 @@ def webhook():
     except Exception as e:
         reply_text = f"Erro ao processar sua mensagem: {str(e)}"
 
+    save_user_state(from_number, state)
+
     resp = MessagingResponse()
     resp.message(reply_text)
     return str(resp)
 
 @app.route("/status", methods=["GET"])
 def status():
-    return {"status": "ok", "usuarios_ativos": len(usuarios)}
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
