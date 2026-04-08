@@ -10,25 +10,24 @@ from twilio.rest import Client as TwilioClient
 from apscheduler.schedulers.background import BackgroundScheduler
 import anthropic
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Anthropic
-anthropic_client = anthropic.Anthropic(
-    api_key=os.environ["ANTHROPIC_API_KEY"]
-)
-
-# Redis
+# =========================
+# CONFIG
+# =========================
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
+
+MAX_TWILIO_MESSAGE_LEN = 1500  # margem de segurança abaixo de 1600
+
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
@@ -42,12 +41,10 @@ Você mantém uma lista de tarefas/contas. Quando o usuário mencionar uma nova 
 Quando marcar como feita, atualize.
 
 IMPORTANTE:
-- O sistema PODE enviar notificações automáticas no WhatsApp se a tarefa tiver horário de lembrete.
+- O sistema pode enviar notificações automáticas no WhatsApp se a tarefa tiver horário de lembrete.
 - Nunca diga que você não consegue lembrar automaticamente.
-- Se o usuário pedir um lembrete com horário (ex: "me lembra de pagar a luz às 13:50"),
-  salve esse horário no campo "remind_at" em formato ISO 8601.
+- Se o usuário pedir um lembrete com horário, salve esse horário no campo "remind_at" em formato ISO 8601.
 - Se o usuário não informar horário, "remind_at" deve ser null.
-- Considere "hoje", "amanhã", horários como "às 14h", "às 13:50", etc.
 - Se não houver data explícita, assuma hoje; se o horário já tiver passado, assuma amanhã.
 - Sempre responda em JSON válido.
 
@@ -88,6 +85,9 @@ Comandos úteis:
 """.strip()
 
 
+# =========================
+# HELPERS
+# =========================
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -107,10 +107,48 @@ def all_users_set_key() -> str:
     return "users:all"
 
 
+def split_message(text: str, max_length: int = MAX_TWILIO_MESSAGE_LEN) -> list[str]:
+    """
+    Divide texto em partes menores para respeitar o limite do Twilio/WhatsApp.
+    Tenta quebrar por linha; se não der, quebra no espaço; se não der, quebra seco.
+    """
+    if not text:
+        return [""]
+
+    text = str(text).strip()
+    parts = []
+
+    while len(text) > max_length:
+        split_index = text.rfind("\n", 0, max_length)
+
+        if split_index == -1 or split_index < int(max_length * 0.5):
+            split_index = text.rfind(" ", 0, max_length)
+
+        if split_index == -1 or split_index < int(max_length * 0.5):
+            split_index = max_length
+
+        chunk = text[:split_index].strip()
+        if chunk:
+            parts.append(chunk)
+
+        text = text[split_index:].strip()
+
+    if text:
+        parts.append(text)
+
+    return parts
+
+
+def add_part_prefix(parts: list[str]) -> list[str]:
+    if len(parts) <= 1:
+        return parts
+    return [f"({i+1}/{len(parts)})\n{part}" for i, part in enumerate(parts)]
+
+
 def normalize_task(task: dict) -> dict:
     return {
         "id": task.get("id"),
-        "name": task.get("name", "").strip(),
+        "name": str(task.get("name", "")).strip(),
         "type": task.get("type", "task"),
         "urgent": bool(task.get("urgent", False)),
         "done": bool(task.get("done", False)),
@@ -138,11 +176,9 @@ def get_user_state(phone: str) -> dict:
 def save_user_state(phone: str, state: dict) -> None:
     key = get_user_key(phone)
 
-    # mantém histórico curto
     if len(state.get("history", [])) > 20:
         state["history"] = state["history"][-20:]
 
-    # normaliza tasks
     state["tasks"] = [normalize_task(t) for t in state.get("tasks", [])]
 
     try:
@@ -150,23 +186,6 @@ def save_user_state(phone: str, state: dict) -> None:
         redis_client.sadd(all_users_set_key(), phone)
     except Exception as e:
         logger.exception("Erro ao salvar estado no Redis para %s: %s", phone, e)
-
-
-def send_whatsapp_message(to_number: str, body: str) -> None:
-    if not twilio_client:
-        logger.warning("Twilio client não configurado. Mensagem não enviada para %s", to_number)
-        return
-
-    if not TWILIO_WHATSAPP_FROM:
-        logger.warning("TWILIO_WHATSAPP_FROM não configurado. Mensagem não enviada para %s", to_number)
-        return
-
-    twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to=to_number,
-        body=body
-    )
-    logger.info("Mensagem enviada para %s", to_number)
 
 
 def parse_anthropic_json(raw_text: str) -> dict | None:
@@ -179,39 +198,6 @@ def parse_anthropic_json(raw_text: str) -> dict | None:
 
 def build_task_context(tasks: list[dict]) -> str:
     return "\n\nLista atual de tarefas do usuário:\n" + json.dumps(tasks, ensure_ascii=False, indent=2)
-
-
-def process_user_message(incoming_msg: str, phone: str) -> str:
-    state = get_user_state(phone)
-    state["history"].append({"role": "user", "content": incoming_msg})
-
-    try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT + build_task_context(state["tasks"]),
-            messages=state["history"]
-        )
-
-        raw = response.content[0].text
-        parsed = parse_anthropic_json(raw)
-
-        if parsed:
-            reply_text = parsed.get("reply", "Tudo certo 👍")
-            tasks = parsed.get("tasks")
-
-            if isinstance(tasks, list):
-                state["tasks"] = [normalize_task(t) for t in tasks]
-        else:
-            reply_text = raw
-
-        state["history"].append({"role": "assistant", "content": raw})
-        save_user_state(phone, state)
-        return reply_text
-
-    except Exception as e:
-        logger.exception("Erro ao processar mensagem do usuário %s: %s", phone, e)
-        return f"Erro ao processar sua mensagem: {str(e)}"
 
 
 def is_due(remind_at: str | None) -> bool:
@@ -237,55 +223,69 @@ def build_reminder_text(task: dict) -> str:
     return f"{prefix}: {name}\n\nResponda 'feito: {name}' quando concluir ✅"
 
 
-def check_due_reminders():
-    logger.info("Verificando lembretes pendentes...")
-
-    try:
-        users = redis_client.smembers(all_users_set_key())
-    except Exception as e:
-        logger.exception("Erro ao buscar usuários no Redis: %s", e)
+# =========================
+# TWILIO SEND
+# =========================
+def send_whatsapp_message(to_number: str, body: str) -> None:
+    if not twilio_client:
+        logger.warning("Twilio client não configurado. Mensagem não enviada para %s", to_number)
         return
 
-    for phone in users:
-        state = get_user_state(phone)
-        changed = False
+    if not TWILIO_WHATSAPP_FROM:
+        logger.warning("TWILIO_WHATSAPP_FROM não configurado. Mensagem não enviada para %s", to_number)
+        return
 
-        for task in state.get("tasks", []):
-            task = normalize_task(task)
+    parts = add_part_prefix(split_message(body))
 
-            if task["done"]:
-                continue
+    for part in parts:
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_number,
+            body=part
+        )
 
-            if task["notified"]:
-                continue
-
-            if is_due(task["remind_at"]):
-                try:
-                    send_whatsapp_message(phone, build_reminder_text(task))
-                    task["notified"] = True
-                    changed = True
-                except Exception as e:
-                    logger.exception("Erro enviando lembrete para %s: %s", phone, e)
-
-        if changed:
-            state["tasks"] = [normalize_task(t) for t in state["tasks"]]
-            # garante atualização dos campos modificados
-            updated_tasks = []
-            original_tasks = state.get("tasks", [])
-
-            for original in original_tasks:
-                normalized = normalize_task(original)
-                if normalized["done"] or normalized["notified"]:
-                    updated_tasks.append(normalized)
-                else:
-                    updated_tasks.append(normalized)
-
-            # melhor abordagem: já reaproveitar os objetos atuais do state
-            state["tasks"] = original_tasks
-            save_user_state(phone, state)
+    logger.info("Mensagem enviada para %s em %s parte(s)", to_number, len(parts))
 
 
-def check_due_reminders_fixed():
+# =========================
+# LLM FLOW
+# =========================
+def process_user_message(incoming_msg: str, phone: str) -> str:
+    state = get_user_state(phone)
+    state["history"].append({"role": "user", "content": incoming_msg})
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT + build_task_context(state["tasks"]),
+            messages=state["history"]
+        )
+
+        raw = response.content[0].text
+        parsed = parse_anthropic_json(raw)
+
+        if parsed:
+            reply_text = parsed.get("reply", "Tudo certo 👍")
+            tasks = parsed.get("tasks")
+            if isinstance(tasks, list):
+                state["tasks"] = [normalize_task(t) for t in tasks]
+        else:
+            reply_text = raw
+
+        state["history"].append({"role": "assistant", "content": raw})
+        save_user_state(phone, state)
+        return reply_text
+
+    except Exception as e:
+        logger.exception("Erro ao processar mensagem do usuário %s: %s", phone, e)
+        return f"Erro ao processar sua mensagem: {str(e)}"
+
+
+# =========================
+# SCHEDULER
+# =========================
+def check_due_reminders():
     logger.info("Verificando lembretes pendentes...")
 
     try:
@@ -316,6 +316,9 @@ def check_due_reminders_fixed():
             save_user_state(phone, state)
 
 
+# =========================
+# ROUTES
+# =========================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.form.get("Body", "").strip()
@@ -324,13 +327,19 @@ def webhook():
     reply_text = process_user_message(incoming_msg, from_number)
 
     resp = MessagingResponse()
-    resp.message(reply_text)
+    parts = add_part_prefix(split_message(reply_text))
+
+    for part in parts:
+        resp.message(part)
+
     return str(resp)
 
 
 @app.route("/status", methods=["GET"])
 def status():
     redis_ok = True
+    twilio_ok = bool(twilio_client and TWILIO_WHATSAPP_FROM)
+
     try:
         redis_client.ping()
     except Exception:
@@ -339,22 +348,26 @@ def status():
     return jsonify({
         "status": "ok",
         "redis": redis_ok,
+        "twilio": twilio_ok,
         "scheduler": "running"
     })
 
 
-# Scheduler
+# =========================
+# STARTUP
+# =========================
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(check_due_reminders_fixed, "interval", minutes=1, id="check_due_reminders")
+scheduler.add_job(
+    check_due_reminders,
+    "interval",
+    minutes=1,
+    id="check_due_reminders",
+    replace_existing=True
+)
 
-
-def start_scheduler():
-    if not scheduler.running:
-        scheduler.start()
-        logger.info("Scheduler iniciado.")
-
-
-start_scheduler()
+if not scheduler.running:
+    scheduler.start()
+    logger.info("Scheduler iniciado.")
 
 
 if __name__ == "__main__":
