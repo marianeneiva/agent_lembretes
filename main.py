@@ -1,7 +1,8 @@
 import os
+import re
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import redis
 from flask import Flask, request, jsonify
@@ -24,7 +25,7 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
 
-MAX_TWILIO_MESSAGE_LEN = 1500  # margem de segurança abaixo de 1600
+MAX_TWILIO_MESSAGE_LEN = 1500
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -46,7 +47,10 @@ IMPORTANTE:
 - Se o usuário pedir um lembrete com horário, salve esse horário no campo "remind_at" em formato ISO 8601.
 - Se o usuário não informar horário, "remind_at" deve ser null.
 - Se não houver data explícita, assuma hoje; se o horário já tiver passado, assuma amanhã.
-- Sempre responda em JSON válido.
+- Responda SOMENTE com JSON puro.
+- NÃO use markdown.
+- NÃO use blocos ```json.
+- NÃO escreva nenhum texto antes ou depois do objeto JSON.
 
 Formato obrigatório:
 {
@@ -59,7 +63,7 @@ Formato obrigatório:
       "urgent": true,
       "done": false,
       "detail": "detalhe opcional",
-      "remind_at": "2026-04-06T13:50:00+00:00" ou null,
+      "remind_at": "2026-04-06T13:50:00-03:00" ou null,
       "notified": false
     }
   ]
@@ -108,10 +112,6 @@ def all_users_set_key() -> str:
 
 
 def split_message(text: str, max_length: int = MAX_TWILIO_MESSAGE_LEN) -> list[str]:
-    """
-    Divide texto em partes menores para respeitar o limite do Twilio/WhatsApp.
-    Tenta quebrar por linha; se não der, quebra no espaço; se não der, quebra seco.
-    """
     if not text:
         return [""]
 
@@ -142,7 +142,14 @@ def split_message(text: str, max_length: int = MAX_TWILIO_MESSAGE_LEN) -> list[s
 def add_part_prefix(parts: list[str]) -> list[str]:
     if len(parts) <= 1:
         return parts
-    return [f"({i+1}/{len(parts)})\n{part}" for i, part in enumerate(parts)]
+
+    formatted = []
+    total = len(parts)
+
+    for i, part in enumerate(parts, start=1):
+        formatted.append(f"Parte {i}/{total}\n{part}")
+
+    return formatted
 
 
 def normalize_task(task: dict) -> dict:
@@ -189,11 +196,30 @@ def save_user_state(phone: str, state: dict) -> None:
 
 
 def parse_anthropic_json(raw_text: str) -> dict | None:
-    try:
-        clean = raw_text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
-    except Exception:
+    if not raw_text:
         return None
+
+    text = raw_text.strip()
+
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
 
 
 def build_task_context(tasks: list[dict]) -> str:
@@ -265,21 +291,26 @@ def process_user_message(incoming_msg: str, phone: str) -> str:
         raw = response.content[0].text
         parsed = parse_anthropic_json(raw)
 
-        if parsed:
-            reply_text = parsed.get("reply", "Tudo certo 👍")
+        if parsed and isinstance(parsed, dict):
+            reply_text = str(parsed.get("reply", "Tudo certo 👍")).strip()
+
             tasks = parsed.get("tasks")
             if isinstance(tasks, list):
                 state["tasks"] = [normalize_task(t) for t in tasks]
         else:
-            reply_text = raw
+            logger.warning("Resposta do modelo não veio em JSON válido.")
+            reply_text = (
+                "Tive um probleminha para formatar a resposta 😅 "
+                "mas entendi sua mensagem. Pode me pedir de novo em uma frase curta?"
+            )
 
-        state["history"].append({"role": "assistant", "content": raw})
+        state["history"].append({"role": "assistant", "content": reply_text})
         save_user_state(phone, state)
         return reply_text
 
     except Exception as e:
         logger.exception("Erro ao processar mensagem do usuário %s: %s", phone, e)
-        return f"Erro ao processar sua mensagem: {str(e)}"
+        return "Erro ao processar sua mensagem 😕"
 
 
 # =========================
