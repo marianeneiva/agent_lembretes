@@ -33,73 +33,114 @@ twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+# Use um modelo ativo da sua conta. Se preferir, troque por outro disponível para você.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+
 SYSTEM_PROMPT = """
-Você é um agente pessoal de lembretes e tarefas em português brasileiro.
-Ajude o usuário a lembrar de pagar contas e fazer tarefas via WhatsApp.
+Você é um agente pessoal de lembretes e tarefas em português brasileiro no WhatsApp.
 
-Você SEMPRE deve usar a ferramenta update_tasks para responder.
-Nunca responda diretamente ao usuário sem chamar a ferramenta.
+Sua função é ENTENDER a intenção do usuário e chamar a ferramenta `task_action`.
 
-Regras:
-- A ferramenta recebe a resposta amigável para o usuário no campo "reply"
-- A ferramenta recebe a lista COMPLETA atualizada no campo "tasks"
-- Quando o usuário mencionar nova tarefa ou conta, adicione
-- Quando marcar como feita, atualize done=true
-- Quando pedir lista, organize no texto do campo reply
-- Se urgente (hoje/amanhã), marque urgent=true
-- Contas/boletos = type "bill", demais = type "task"
-- Se houver horário de lembrete, preencha remind_at em ISO 8601
-- Se não houver horário, remind_at = null
-- Tarefas concluídas não devem ser notificadas
-- Tarefas novas com lembrete devem começar com notified=false
-- Responda sempre em português brasileiro
-- Use emojis com moderação
+Regras importantes:
+- Nunca responda diretamente ao usuário sem chamar a ferramenta `task_action`.
+- Você NÃO deve reescrever a agenda inteira manualmente.
+- Você deve informar apenas a ação desejada:
+  - add_task
+  - mark_done
+  - mark_urgent
+  - delete_task
+  - list_tasks
+  - noop
+- Para ações em item existente, use `target_name` com o nome mais provável da tarefa.
+- Para adicionar tarefa, preencha `task`.
+- Para listar, use action=list_tasks.
+- Para mensagens como "feito: X", normalmente use action=mark_done.
+- Para mensagens como "urgente: X", normalmente use action=mark_urgent.
+- Para mensagens ambíguas, use noop.
+- Responda sempre em português brasileiro.
+- Use emojis com moderação.
+- Seja útil e breve.
+
+Sobre tarefas:
+- type = "bill" para contas/boletos
+- type = "task" para demais tarefas
+- urgent = true se claramente hoje/amanhã ou o usuário disser que é urgente
+- done = false ao criar nova tarefa
+- detail = detalhe curto opcional
+- remind_at = ISO 8601 se houver horário explícito de lembrete, senão null
+- notified = false em tarefa nova
 """.strip()
 
 TOOLS = [
     {
-        "name": "update_tasks",
-        "description": "Atualiza a lista de tarefas e define a resposta que será enviada ao usuário no WhatsApp.",
+        "name": "task_action",
+        "description": "Define a ação a ser aplicada sobre a agenda do usuário.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "reply": {
                     "type": "string",
-                    "description": "Mensagem amigável e curta para o usuário."
+                    "description": "Mensagem amigável que será enviada ao usuário no WhatsApp."
                 },
-                "tasks": {
-                    "type": "array",
-                    "description": "Lista completa e atualizada de tarefas do usuário.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "integer"},
-                            "name": {"type": "string"},
-                            "type": {"type": "string", "enum": ["bill", "task"]},
-                            "urgent": {"type": "boolean"},
-                            "done": {"type": "boolean"},
-                            "detail": {"type": ["string", "null"]},
-                            "remind_at": {"type": ["string", "null"]},
-                            "notified": {"type": "boolean"}
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "add_task",
+                        "mark_done",
+                        "mark_urgent",
+                        "delete_task",
+                        "list_tasks",
+                        "noop"
+                    ]
+                },
+                "target_name": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "null"}
+                    ],
+                    "description": "Nome da tarefa alvo para editar/remover/marcar."
+                },
+                "task": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "type": {"type": "string", "enum": ["bill", "task"]},
+                                "urgent": {"type": "boolean"},
+                                "done": {"type": "boolean"},
+                                "detail": {
+                                    "anyOf": [
+                                        {"type": "string"},
+                                        {"type": "null"}
+                                    ]
+                                },
+                                "remind_at": {
+                                    "anyOf": [
+                                        {"type": "string"},
+                                        {"type": "null"}
+                                    ]
+                                },
+                                "notified": {"type": "boolean"}
+                            },
+                            "required": [
+                                "name",
+                                "type",
+                                "urgent",
+                                "done",
+                                "detail",
+                                "remind_at",
+                                "notified"
+                            ],
+                            "additionalProperties": False
                         },
-                        "required": [
-                            "id",
-                            "name",
-                            "type",
-                            "urgent",
-                            "done",
-                            "detail",
-                            "remind_at",
-                            "notified"
-                        ],
-                        "additionalProperties": False
-                    }
+                        {"type": "null"}
+                    ]
                 }
             },
-            "required": ["reply", "tasks"],
+            "required": ["reply", "action", "target_name", "task"],
             "additionalProperties": False
-        },
-        "strict": True
+        }
     }
 ]
 
@@ -157,6 +198,7 @@ def split_message(text: str, max_length: int = MAX_TWILIO_MESSAGE_LEN) -> list[s
 def add_part_prefix(parts: list[str]) -> list[str]:
     if len(parts) <= 1:
         return parts
+
     total = len(parts)
     return [f"Parte {i}/{total}\n{part}" for i, part in enumerate(parts, start=1)]
 
@@ -231,6 +273,127 @@ def build_reminder_text(task: dict) -> str:
     return f"{prefix}: {name}\n\nResponda 'feito: {name}' quando concluir ✅"
 
 
+def format_task_list(tasks: list[dict]) -> str:
+    pending = [t for t in tasks if not t["done"]]
+
+    if not pending:
+        return "Sua agenda está vazia no momento 😊"
+
+    urgent = [t for t in pending if t["urgent"]]
+    recurring = [t for t in pending if any(word in (t["detail"] or "").lower() for word in ["todo", "toda", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"])]
+    bills = [t for t in pending if t["type"] == "bill"]
+    normal = [t for t in pending if t not in urgent and t not in recurring and t not in bills]
+
+    lines = ["📋 *Sua Agenda:*", ""]
+
+    if urgent:
+        lines.append("🔥 *Urgente:*")
+        for t in urgent:
+            detail = f" - {t['detail']}" if t["detail"] else ""
+            lines.append(f"• {t['name']}{detail}")
+        lines.append("")
+
+    if normal:
+        lines.append("📝 *Tarefas:*")
+        for t in normal:
+            detail = f" - {t['detail']}" if t["detail"] else ""
+            lines.append(f"• {t['name']}{detail}")
+        lines.append("")
+
+    if recurring:
+        lines.append("🔁 *Recorrentes:*")
+        for t in recurring:
+            detail = f" - {t['detail']}" if t["detail"] else ""
+            lines.append(f"• {t['name']}{detail}")
+        lines.append("")
+
+    if bills:
+        lines.append("💸 *Contas:*")
+        for t in bills:
+            detail = f" - {t['detail']}" if t["detail"] else ""
+            lines.append(f"• {t['name']}{detail}")
+
+    return "\n".join(lines).strip()
+
+
+def find_task_index(tasks: list[dict], target_name: str) -> int:
+    target = target_name.strip().lower()
+    if not target:
+        return -1
+
+    # Match exato
+    for i, task in enumerate(tasks):
+        if task["name"].strip().lower() == target:
+            return i
+
+    # Contido
+    for i, task in enumerate(tasks):
+        name = task["name"].strip().lower()
+        if target in name or name in target:
+            return i
+
+    return -1
+
+
+def next_task_id(tasks: list[dict]) -> int:
+    ids = [t["id"] for t in tasks if isinstance(t.get("id"), int)]
+    return max(ids, default=0) + 1
+
+
+def apply_action_to_state(state: dict, tool_input: dict) -> str:
+    reply = str(tool_input.get("reply", "Tudo certo 👍")).strip() or "Tudo certo 👍"
+    action = tool_input.get("action", "noop")
+    target_name = (tool_input.get("target_name") or "").strip()
+    new_task = tool_input.get("task")
+
+    tasks = [normalize_task(t) for t in state.get("tasks", [])]
+
+    if action == "mark_done":
+        idx = find_task_index(tasks, target_name)
+        if idx == -1:
+            return "Não encontrei essa tarefa na sua agenda 😕"
+        tasks[idx]["done"] = True
+        tasks[idx]["notified"] = True
+
+    elif action == "mark_urgent":
+        idx = find_task_index(tasks, target_name)
+        if idx == -1:
+            return "Não encontrei essa tarefa para marcar como urgente 😕"
+        tasks[idx]["urgent"] = True
+
+    elif action == "delete_task":
+        idx = find_task_index(tasks, target_name)
+        if idx == -1:
+            return "Não encontrei essa tarefa para remover 😕"
+        tasks.pop(idx)
+
+    elif action == "add_task":
+        if not isinstance(new_task, dict):
+            return "Entendi que você quer adicionar algo, mas faltaram detalhes 😕"
+
+        normalized = normalize_task(new_task)
+        if not normalized["name"]:
+            return "Não consegui identificar o nome da tarefa 😕"
+
+        normalized["id"] = next_task_id(tasks)
+
+        # Se já existir algo muito parecido e ainda pendente, evita duplicar
+        existing_idx = find_task_index(tasks, normalized["name"])
+        if existing_idx != -1 and not tasks[existing_idx]["done"]:
+            return "Essa tarefa já está na sua agenda 😉"
+
+        tasks.append(normalized)
+
+    elif action == "list_tasks":
+        reply = format_task_list(tasks)
+
+    elif action == "noop":
+        pass
+
+    state["tasks"] = tasks
+    return reply
+
+
 # =========================
 # TWILIO SEND
 # =========================
@@ -260,7 +423,7 @@ def send_whatsapp_message(to_number: str, body: str) -> None:
 # =========================
 def extract_tool_use_block(message):
     for block in message.content:
-        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "update_tasks":
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "task_action":
             return block
     return None
 
@@ -268,65 +431,35 @@ def extract_tool_use_block(message):
 def process_user_message(incoming_msg: str, phone: str) -> str:
     state = get_user_state(phone)
 
-    # histórico em formato simples de texto
-    prior_messages = state.get("history", [])
-    user_prompt = f"{build_task_context(state['tasks'])}\n\nMensagem do usuário: {incoming_msg}"
-
-    messages = prior_messages + [
-        {"role": "user", "content": user_prompt}
+    messages = [
+        {
+            "role": "user",
+            "content": f"{build_task_context(state['tasks'])}\n\nMensagem do usuário: {incoming_msg}"
+        }
     ]
 
     try:
-        first_response = anthropic_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=700,
+        response = anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages
         )
 
-        tool_block = extract_tool_use_block(first_response)
+        tool_block = extract_tool_use_block(response)
 
         if not tool_block:
-            logger.warning("Claude não chamou a ferramenta update_tasks.")
-            reply_text = "Entendi sua mensagem, mas tive uma falha ao atualizar suas tarefas 😅"
-            state["history"].append({"role": "user", "content": user_prompt})
+            logger.warning("Claude não chamou a ferramenta task_action.")
+            reply_text = "Entendi sua mensagem, mas tive uma falha ao atualizar sua agenda 😅"
+            state["history"].append({"role": "user", "content": incoming_msg})
             state["history"].append({"role": "assistant", "content": reply_text})
             save_user_state(phone, state)
             return reply_text
 
-        tool_input = tool_block.input
-        reply_text = str(tool_input.get("reply", "Tudo certo 👍")).strip()
-        tasks = tool_input.get("tasks", [])
+        reply_text = apply_action_to_state(state, tool_block.input)
 
-        if isinstance(tasks, list):
-            state["tasks"] = [normalize_task(t) for t in tasks]
-
-        # devolve tool_result para completar o loop corretamente
-        second_response = anthropic_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=50,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages + [
-                {
-                    "role": "assistant",
-                    "content": first_response.content
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_block.id,
-                            "content": json.dumps({"status": "ok"}, ensure_ascii=False)
-                        }
-                    ]
-                }
-            ]
-        )
-
-        state["history"].append({"role": "user", "content": user_prompt})
+        state["history"].append({"role": "user", "content": incoming_msg})
         state["history"].append({"role": "assistant", "content": reply_text})
         save_user_state(phone, state)
         return reply_text
