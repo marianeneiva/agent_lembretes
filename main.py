@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import logging
 from datetime import datetime, timezone
@@ -38,55 +37,71 @@ SYSTEM_PROMPT = """
 Você é um agente pessoal de lembretes e tarefas em português brasileiro.
 Ajude o usuário a lembrar de pagar contas e fazer tarefas via WhatsApp.
 
-Você mantém uma lista de tarefas/contas. Quando o usuário mencionar uma nova tarefa ou conta, adicione-a.
-Quando marcar como feita, atualize.
-
-IMPORTANTE:
-- O sistema pode enviar notificações automáticas no WhatsApp se a tarefa tiver horário de lembrete.
-- Nunca diga que você não consegue lembrar automaticamente.
-- Se o usuário pedir um lembrete com horário, salve esse horário no campo "remind_at" em formato ISO 8601.
-- Se o usuário não informar horário, "remind_at" deve ser null.
-- Se não houver data explícita, assuma hoje; se o horário já tiver passado, assuma amanhã.
-- Responda SOMENTE com JSON puro.
-- NÃO use markdown.
-- NÃO use blocos ```json.
-- NÃO escreva nenhum texto antes ou depois do objeto JSON.
-
-Formato obrigatório:
-{
-  "reply": "resposta amigável e direta ao usuário",
-  "tasks": [
-    {
-      "id": número único,
-      "name": "nome curto da tarefa",
-      "type": "bill" ou "task",
-      "urgent": true,
-      "done": false,
-      "detail": "detalhe opcional",
-      "remind_at": "2026-04-06T13:50:00-03:00" ou null,
-      "notified": false
-    }
-  ]
-}
+Você SEMPRE deve usar a ferramenta update_tasks para responder.
+Nunca responda diretamente ao usuário sem chamar a ferramenta.
 
 Regras:
-- Use português brasileiro
-- Use emojis moderadamente
-- Ao adicionar tarefas, confirme o que foi adicionado
-- Mantenha SEMPRE a lista completa atualizada no campo "tasks"
-- Se urgente (hoje/amanhã), marque urgent: true
+- A ferramenta recebe a resposta amigável para o usuário no campo "reply"
+- A ferramenta recebe a lista COMPLETA atualizada no campo "tasks"
+- Quando o usuário mencionar nova tarefa ou conta, adicione
+- Quando marcar como feita, atualize done=true
+- Quando pedir lista, organize no texto do campo reply
+- Se urgente (hoje/amanhã), marque urgent=true
 - Contas/boletos = type "bill", demais = type "task"
-- Quando listar, mostre as pendentes organizadas
-- Quando marcar como concluída, mantenha done=true
+- Se houver horário de lembrete, preencha remind_at em ISO 8601
+- Se não houver horário, remind_at = null
 - Tarefas concluídas não devem ser notificadas
-- Ao criar nova tarefa com lembrete, notified deve começar como false
-
-Comandos úteis:
-- "listar" → mostra tarefas pendentes
-- "feito: [nome]" → marca tarefa como concluída
-- "urgente: [nome]" → marca como urgente
-- "ajuda" → mostra comandos
+- Tarefas novas com lembrete devem começar com notified=false
+- Responda sempre em português brasileiro
+- Use emojis com moderação
 """.strip()
+
+TOOLS = [
+    {
+        "name": "update_tasks",
+        "description": "Atualiza a lista de tarefas e define a resposta que será enviada ao usuário no WhatsApp.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reply": {
+                    "type": "string",
+                    "description": "Mensagem amigável e curta para o usuário."
+                },
+                "tasks": {
+                    "type": "array",
+                    "description": "Lista completa e atualizada de tarefas do usuário.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "name": {"type": "string"},
+                            "type": {"type": "string", "enum": ["bill", "task"]},
+                            "urgent": {"type": "boolean"},
+                            "done": {"type": "boolean"},
+                            "detail": {"type": ["string", "null"]},
+                            "remind_at": {"type": ["string", "null"]},
+                            "notified": {"type": "boolean"}
+                        },
+                        "required": [
+                            "id",
+                            "name",
+                            "type",
+                            "urgent",
+                            "done",
+                            "detail",
+                            "remind_at",
+                            "notified"
+                        ],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            "required": ["reply", "tasks"],
+            "additionalProperties": False
+        },
+        "strict": True
+    }
+]
 
 
 # =========================
@@ -142,19 +157,13 @@ def split_message(text: str, max_length: int = MAX_TWILIO_MESSAGE_LEN) -> list[s
 def add_part_prefix(parts: list[str]) -> list[str]:
     if len(parts) <= 1:
         return parts
-
-    formatted = []
     total = len(parts)
-
-    for i, part in enumerate(parts, start=1):
-        formatted.append(f"Parte {i}/{total}\n{part}")
-
-    return formatted
+    return [f"Parte {i}/{total}\n{part}" for i, part in enumerate(parts, start=1)]
 
 
 def normalize_task(task: dict) -> dict:
     return {
-        "id": task.get("id"),
+        "id": int(task.get("id", 0)),
         "name": str(task.get("name", "")).strip(),
         "type": task.get("type", "task"),
         "urgent": bool(task.get("urgent", False)),
@@ -195,35 +204,8 @@ def save_user_state(phone: str, state: dict) -> None:
         logger.exception("Erro ao salvar estado no Redis para %s: %s", phone, e)
 
 
-def parse_anthropic_json(raw_text: str) -> dict | None:
-    if not raw_text:
-        return None
-
-    text = raw_text.strip()
-
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    return None
-
-
 def build_task_context(tasks: list[dict]) -> str:
-    return "\n\nLista atual de tarefas do usuário:\n" + json.dumps(tasks, ensure_ascii=False, indent=2)
+    return "Lista atual de tarefas do usuário:\n" + json.dumps(tasks, ensure_ascii=False, indent=2)
 
 
 def is_due(remind_at: str | None) -> bool:
@@ -274,36 +256,77 @@ def send_whatsapp_message(to_number: str, body: str) -> None:
 
 
 # =========================
-# LLM FLOW
+# CLAUDE TOOL USE
 # =========================
+def extract_tool_use_block(message):
+    for block in message.content:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "update_tasks":
+            return block
+    return None
+
+
 def process_user_message(incoming_msg: str, phone: str) -> str:
     state = get_user_state(phone)
-    state["history"].append({"role": "user", "content": incoming_msg})
+
+    # histórico em formato simples de texto
+    prior_messages = state.get("history", [])
+    user_prompt = f"{build_task_context(state['tasks'])}\n\nMensagem do usuário: {incoming_msg}"
+
+    messages = prior_messages + [
+        {"role": "user", "content": user_prompt}
+    ]
 
     try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT + build_task_context(state["tasks"]),
-            messages=state["history"]
+        first_response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=700,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages
         )
 
-        raw = response.content[0].text
-        parsed = parse_anthropic_json(raw)
+        tool_block = extract_tool_use_block(first_response)
 
-        if parsed and isinstance(parsed, dict):
-            reply_text = str(parsed.get("reply", "Tudo certo 👍")).strip()
+        if not tool_block:
+            logger.warning("Claude não chamou a ferramenta update_tasks.")
+            reply_text = "Entendi sua mensagem, mas tive uma falha ao atualizar suas tarefas 😅"
+            state["history"].append({"role": "user", "content": user_prompt})
+            state["history"].append({"role": "assistant", "content": reply_text})
+            save_user_state(phone, state)
+            return reply_text
 
-            tasks = parsed.get("tasks")
-            if isinstance(tasks, list):
-                state["tasks"] = [normalize_task(t) for t in tasks]
-        else:
-            logger.warning("Resposta do modelo não veio em JSON válido.")
-            reply_text = (
-                "Tive um probleminha para formatar a resposta 😅 "
-                "mas entendi sua mensagem. Pode me pedir de novo em uma frase curta?"
-            )
+        tool_input = tool_block.input
+        reply_text = str(tool_input.get("reply", "Tudo certo 👍")).strip()
+        tasks = tool_input.get("tasks", [])
 
+        if isinstance(tasks, list):
+            state["tasks"] = [normalize_task(t) for t in tasks]
+
+        # devolve tool_result para completar o loop corretamente
+        second_response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=50,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages + [
+                {
+                    "role": "assistant",
+                    "content": first_response.content
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_block.id,
+                            "content": json.dumps({"status": "ok"}, ensure_ascii=False)
+                        }
+                    ]
+                }
+            ]
+        )
+
+        state["history"].append({"role": "user", "content": user_prompt})
         state["history"].append({"role": "assistant", "content": reply_text})
         save_user_state(phone, state)
         return reply_text
