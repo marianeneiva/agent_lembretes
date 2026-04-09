@@ -22,7 +22,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+16414524081
 
 MAX_TWILIO_MESSAGE_LEN = 1500
 
@@ -33,7 +33,6 @@ twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# Use um modelo ativo da sua conta. Se preferir, troque por outro disponível para você.
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 SYSTEM_PROMPT = """
@@ -280,7 +279,13 @@ def format_task_list(tasks: list[dict]) -> str:
         return "Sua agenda está vazia no momento 😊"
 
     urgent = [t for t in pending if t["urgent"]]
-    recurring = [t for t in pending if any(word in (t["detail"] or "").lower() for word in ["todo", "toda", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"])]
+    recurring = [
+        t for t in pending
+        if any(
+            word in (t["detail"] or "").lower()
+            for word in ["todo", "toda", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+        )
+    ]
     bills = [t for t in pending if t["type"] == "bill"]
     normal = [t for t in pending if t not in urgent and t not in recurring and t not in bills]
 
@@ -321,12 +326,10 @@ def find_task_index(tasks: list[dict], target_name: str) -> int:
     if not target:
         return -1
 
-    # Match exato
     for i, task in enumerate(tasks):
         if task["name"].strip().lower() == target:
             return i
 
-    # Contido
     for i, task in enumerate(tasks):
         name = task["name"].strip().lower()
         if target in name or name in target:
@@ -377,7 +380,6 @@ def apply_action_to_state(state: dict, tool_input: dict) -> str:
 
         normalized["id"] = next_task_id(tasks)
 
-        # Se já existir algo muito parecido e ainda pendente, evita duplicar
         existing_idx = find_task_index(tasks, normalized["name"])
         if existing_idx != -1 and not tasks[existing_idx]["done"]:
             return "Essa tarefa já está na sua agenda 😉"
@@ -511,6 +513,8 @@ def webhook():
     incoming_msg = request.form.get("Body", "").strip()
     from_number = request.form.get("From", "").strip()
 
+    logger.info("Mensagem recebida de %s: %s", from_number, incoming_msg)
+
     reply_text = process_user_message(incoming_msg, from_number)
 
     resp = MessagingResponse()
@@ -519,11 +523,17 @@ def webhook():
     for part in parts:
         resp.message(part)
 
-    return str(resp)
+    return str(resp), 200, {"Content-Type": "application/xml"}
 
 
-@app.route("/status", methods=["GET"])
-def status():
+@app.route("/status", methods=["POST"])
+def status_callback():
+    logger.info("Status callback recebido: %s", dict(request.form))
+    return ("", 200)
+
+
+@app.route("/health", methods=["GET"])
+def health():
     redis_ok = True
     twilio_ok = bool(twilio_client and TWILIO_WHATSAPP_FROM)
 
@@ -537,6 +547,16 @@ def status():
         "redis": redis_ok,
         "twilio": twilio_ok,
         "scheduler": "running"
+    })
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "message": "API do agente de lembretes online.",
+        "webhook": "/webhook",
+        "status_callback": "/status",
+        "health": "/health"
     })
 
 
